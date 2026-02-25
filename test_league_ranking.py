@@ -1,18 +1,34 @@
+
 """
 Unit tests for League Ranking Calculator.
 
 Run with:
-    python3.14 -m unittest test_league_ranking.py
+    python3.14 -m unittest test_league_ranking.py -v
 """
 
+import os
+import sys
+import tempfile
 import unittest
+from datetime import date
+from unittest.mock import patch
+
 from league_ranking import (
+    # v1
     parse_result,
     parse_input,
     calculate_points,
     rank_teams,
     format_points,
     format_table,
+    # v2
+    parse_date_from_string,
+    parse_date_from_file,
+    load_directory,
+    load_stdin_blocks,
+    run_recursive,
+    run_recursive_local,
+    run_recursive_verbose,
 )
 
 
@@ -67,6 +83,17 @@ class TestParseInput(unittest.TestCase):
         result = parse_input(lines)
         self.assertEqual(len(result), 2)
 
+    def test_skips_date_header_style_date(self):
+        lines = ["DATE: 2024-01-15\n", "Lions 3, Snakes 3\n"]
+        result = parse_input(lines)
+        self.assertEqual(len(result), 1)
+        self.assertEqual(result[0], ("Lions", 3, "Snakes", 3))
+
+    def test_skips_hash_style_date_header(self):
+        lines = ["# 2024-01-15\n", "Lions 3, Snakes 3\n"]
+        result = parse_input(lines)
+        self.assertEqual(len(result), 1)
+
     def test_empty_input_returns_empty_list(self):
         self.assertEqual(parse_input([]), [])
 
@@ -97,9 +124,9 @@ class TestCalculatePoints(unittest.TestCase):
 
     def test_points_accumulate_across_matches(self):
         results = [
-            ("Lions", 3, "Snakes", 3),   # draw: Lions 1, Snakes 1
-            ("Lions", 1, "FC Awesome", 1), # draw: Lions 1, FC Awesome 1
-            ("Lions", 4, "Grouches", 0),  # win: Lions 3
+            ("Lions", 3, "Snakes", 3),
+            ("Lions", 1, "FC Awesome", 1),
+            ("Lions", 4, "Grouches", 0),
         ]
         points = calculate_points(results)
         self.assertEqual(points["Lions"], 5)
@@ -145,7 +172,7 @@ class TestRankTeams(unittest.TestCase):
     def test_tied_teams_share_rank(self):
         points = {"FC Awesome": 1, "Snakes": 1}
         ranked = rank_teams(points)
-        self.assertEqual(ranked[0][0], ranked[1][0])  # same rank
+        self.assertEqual(ranked[0][0], ranked[1][0])
 
     def test_tied_teams_are_alphabetical(self):
         points = {"Snakes": 1, "FC Awesome": 1}
@@ -227,7 +254,355 @@ class TestFormatTable(unittest.TestCase):
 
 
 # ---------------------------------------------------------------------------
-# Integration test
+# parse_date_from_string
+# ---------------------------------------------------------------------------
+
+class TestParseDateFromString(unittest.TestCase):
+
+    def test_bare_date(self):
+        self.assertEqual(parse_date_from_string("2024-01-15"), date(2024, 1, 15))
+
+    def test_date_header_style(self):
+        self.assertEqual(parse_date_from_string("DATE: 2024-01-15"), date(2024, 1, 15))
+
+    def test_hash_style_header(self):
+        self.assertEqual(parse_date_from_string("# 2024-01-15"), date(2024, 1, 15))
+
+    def test_date_in_filename(self):
+        self.assertEqual(parse_date_from_string("2024-01-15.txt"), date(2024, 1, 15))
+
+    def test_no_date_returns_none(self):
+        self.assertIsNone(parse_date_from_string("Lions 3, Snakes 3"))
+
+    def test_empty_string_returns_none(self):
+        self.assertIsNone(parse_date_from_string(""))
+
+    def test_invalid_date_returns_none(self):
+        self.assertIsNone(parse_date_from_string("2024-99-99"))
+
+
+# ---------------------------------------------------------------------------
+# parse_date_from_file
+# ---------------------------------------------------------------------------
+
+class TestParseDateFromFile(unittest.TestCase):
+
+    def test_date_from_filename(self):
+        d = parse_date_from_file("/results/2024-01-15.txt", [])
+        self.assertEqual(d, date(2024, 1, 15))
+
+    def test_date_from_first_line_bare(self):
+        d = parse_date_from_file("/results/matchday.txt", ["2024-03-10\n", "Lions 3, Snakes 1\n"])
+        self.assertEqual(d, date(2024, 3, 10))
+
+    def test_date_from_first_line_date_header(self):
+        d = parse_date_from_file("/results/matchday.txt", ["DATE: 2024-03-10\n", "Lions 3, Snakes 1\n"])
+        self.assertEqual(d, date(2024, 3, 10))
+
+    def test_filename_takes_priority_over_first_line(self):
+        d = parse_date_from_file("/results/2024-01-15.txt", ["2024-06-20\n", "Lions 3, Snakes 1\n"])
+        self.assertEqual(d, date(2024, 1, 15))
+
+    def test_no_date_returns_none(self):
+        d = parse_date_from_file("/results/matchday.txt", ["Lions 3, Snakes 1\n"])
+        self.assertIsNone(d)
+
+    def test_skips_blank_lines_for_first_line_check(self):
+        d = parse_date_from_file("/results/matchday.txt", ["\n", "  \n", "2024-05-01\n"])
+        self.assertEqual(d, date(2024, 5, 1))
+
+
+# ---------------------------------------------------------------------------
+# load_directory
+# ---------------------------------------------------------------------------
+
+class TestLoadDirectory(unittest.TestCase):
+
+    def _make_dir(self, files: dict[str, str]) -> str:
+        """Create a temp directory with the given filename->content mapping."""
+        tmpdir = tempfile.mkdtemp()
+        for name, content in files.items():
+            with open(os.path.join(tmpdir, name), "w") as f:
+                f.write(content)
+        return tmpdir
+
+    def test_loads_files_by_filename_date(self):
+        tmpdir = self._make_dir({
+            "2024-01-15.txt": "Lions 3, Snakes 1\n",
+            "2024-01-16.txt": "Tarantulas 1, FC Awesome 0\n",
+        })
+        blocks = load_directory(tmpdir)
+        self.assertEqual(len(blocks), 2)
+        self.assertEqual(blocks[0][0], date(2024, 1, 15))
+        self.assertEqual(blocks[1][0], date(2024, 1, 16))
+
+    def test_loads_files_by_first_line_date(self):
+        tmpdir = self._make_dir({
+            "matchday1.txt": "2024-02-01\nLions 3, Snakes 1\n",
+        })
+        blocks = load_directory(tmpdir)
+        self.assertEqual(len(blocks), 1)
+        self.assertEqual(blocks[0][0], date(2024, 2, 1))
+
+    def test_sorts_blocks_chronologically(self):
+        tmpdir = self._make_dir({
+            "2024-03-10.txt": "Lions 3, Snakes 1\n",
+            "2024-01-05.txt": "Tarantulas 1, FC Awesome 0\n",
+            "2024-06-20.txt": "Grouches 0, Lions 4\n",
+        })
+        blocks = load_directory(tmpdir)
+        dates = [b[0] for b in blocks]
+        self.assertEqual(dates, sorted(dates))
+
+    def test_skips_undatable_files_with_warning(self):
+        tmpdir = self._make_dir({
+            "2024-01-15.txt": "Lions 3, Snakes 1\n",
+            "nodatehere.txt": "Tarantulas 1, FC Awesome 0\n",
+        })
+        with patch("sys.stderr"):
+            blocks = load_directory(tmpdir)
+        self.assertEqual(len(blocks), 1)
+
+    def test_ignores_non_txt_files(self):
+        tmpdir = self._make_dir({
+            "2024-01-15.txt": "Lions 3, Snakes 1\n",
+            "2024-01-16.csv": "ignored content\n",
+        })
+        blocks = load_directory(tmpdir)
+        self.assertEqual(len(blocks), 1)
+
+    def test_date_header_stripped_from_content(self):
+        tmpdir = self._make_dir({
+            "matchday.txt": "DATE: 2024-04-01\nLions 3, Snakes 1\n",
+        })
+        blocks = load_directory(tmpdir)
+        results = parse_input(blocks[0][1])
+        self.assertEqual(len(results), 1)
+        self.assertEqual(results[0], ("Lions", 3, "Snakes", 1))
+
+    def test_empty_directory_returns_empty_list(self):
+        tmpdir = tempfile.mkdtemp()
+        blocks = load_directory(tmpdir)
+        self.assertEqual(blocks, [])
+
+
+# ---------------------------------------------------------------------------
+# load_stdin_blocks
+# ---------------------------------------------------------------------------
+
+class TestLoadStdinBlocks(unittest.TestCase):
+
+    def test_date_header_style(self):
+        lines = [
+            "DATE: 2024-01-15\n",
+            "Lions 3, Snakes 3\n",
+            "DATE: 2024-01-16\n",
+            "Tarantulas 3, Snakes 1\n",
+        ]
+        blocks = load_stdin_blocks(lines)
+        self.assertEqual(len(blocks), 2)
+        self.assertEqual(blocks[0][0], date(2024, 1, 15))
+        self.assertEqual(blocks[1][0], date(2024, 1, 16))
+
+    def test_hash_header_style(self):
+        lines = [
+            "# 2024-01-15\n",
+            "Lions 3, Snakes 3\n",
+            "# 2024-01-16\n",
+            "Tarantulas 3, Snakes 1\n",
+        ]
+        blocks = load_stdin_blocks(lines)
+        self.assertEqual(len(blocks), 2)
+        self.assertEqual(blocks[0][0], date(2024, 1, 15))
+
+    def test_mixed_header_styles(self):
+        lines = [
+            "DATE: 2024-01-15\n",
+            "Lions 3, Snakes 3\n",
+            "# 2024-01-16\n",
+            "Tarantulas 3, Snakes 1\n",
+        ]
+        blocks = load_stdin_blocks(lines)
+        self.assertEqual(len(blocks), 2)
+
+    def test_sorts_out_of_order_dates(self):
+        lines = [
+            "DATE: 2024-03-01\n",
+            "Lions 3, Snakes 1\n",
+            "DATE: 2024-01-01\n",
+            "Tarantulas 1, FC Awesome 0\n",
+        ]
+        blocks = load_stdin_blocks(lines)
+        self.assertEqual(blocks[0][0], date(2024, 1, 1))
+        self.assertEqual(blocks[1][0], date(2024, 3, 1))
+
+    def test_orphan_lines_before_first_header_ignored(self):
+        lines = [
+            "Lions 3, Snakes 3\n",      # orphan — no date header yet
+            "DATE: 2024-01-15\n",
+            "Tarantulas 1, FC Awesome 0\n",
+        ]
+        with patch("sys.stderr"):
+            blocks = load_stdin_blocks(lines)
+        self.assertEqual(len(blocks), 1)
+        results = parse_input(blocks[0][1])
+        self.assertEqual(results[0], ("Tarantulas", 1, "FC Awesome", 0))
+
+    def test_no_headers_returns_empty(self):
+        lines = ["Lions 3, Snakes 3\n"]
+        with patch("sys.stderr"):
+            blocks = load_stdin_blocks(lines)
+        self.assertEqual(blocks, [])
+
+    def test_empty_input_returns_empty(self):
+        self.assertEqual(load_stdin_blocks([]), [])
+
+    def test_blank_lines_between_blocks_ignored(self):
+        lines = [
+            "DATE: 2024-01-15\n",
+            "Lions 3, Snakes 3\n",
+            "\n",
+            "DATE: 2024-01-16\n",
+            "Tarantulas 3, Snakes 1\n",
+        ]
+        blocks = load_stdin_blocks(lines)
+        self.assertEqual(len(blocks), 2)
+
+
+# ---------------------------------------------------------------------------
+# run_recursive
+# ---------------------------------------------------------------------------
+
+class TestRunRecursive(unittest.TestCase):
+
+    def _blocks(self):
+        return [
+            (date(2024, 1, 15), ["Lions 3, Snakes 3\n", "Tarantulas 1, FC Awesome 0\n"]),
+            (date(2024, 1, 16), ["Tarantulas 3, Snakes 1\n", "Lions 4, Grouches 0\n"]),
+            (date(2024, 1, 17), ["Lions 1, FC Awesome 1\n"]),
+        ]
+
+    def test_outputs_single_global_table(self, ):
+        with patch("builtins.print") as mock_print:
+            run_recursive(self._blocks())
+        output = mock_print.call_args[0][0]
+        self.assertIn("1. Tarantulas, 6 pts", output)
+        self.assertIn("2. Lions, 5 pts", output)
+        self.assertEqual(output.count("==="), 0)  # no section headers
+
+    def test_combines_all_results(self):
+        with patch("builtins.print") as mock_print:
+            run_recursive(self._blocks())
+        output = mock_print.call_args[0][0]
+        # Grouches only appears in day 2 — must still be in global table
+        self.assertIn("Grouches", output)
+
+    def test_single_block(self):
+        blocks = [(date(2024, 1, 15), ["Lions 3, Snakes 1\n"])]
+        with patch("builtins.print") as mock_print:
+            run_recursive(blocks)
+        output = mock_print.call_args[0][0]
+        self.assertIn("Lions", output)
+        self.assertIn("Snakes", output)
+
+
+# ---------------------------------------------------------------------------
+# run_recursive_local
+# ---------------------------------------------------------------------------
+
+class TestRunRecursiveLocal(unittest.TestCase):
+
+    def _blocks(self):
+        return [
+            (date(2024, 1, 15), ["Lions 3, Snakes 3\n"]),
+            (date(2024, 1, 16), ["Tarantulas 3, Snakes 1\n"]),
+        ]
+
+    def test_outputs_section_per_date(self):
+        with patch("builtins.print") as mock_print:
+            run_recursive_local(self._blocks())
+        output = mock_print.call_args[0][0]
+        self.assertIn("=== 2024-01-15 ===", output)
+        self.assertIn("=== 2024-01-16 ===", output)
+
+    def test_each_section_is_independent(self):
+        blocks = [
+            (date(2024, 1, 15), ["Lions 3, Snakes 3\n"]),   # draw only
+            (date(2024, 1, 16), ["Tarantulas 3, Snakes 1\n"]),  # Tarantulas wins
+        ]
+        with patch("builtins.print") as mock_print:
+            run_recursive_local(blocks)
+        output = mock_print.call_args[0][0]
+        sections = output.split("\n\n")
+        # Day 1: Lions and Snakes both 1pt — Tarantulas should NOT appear
+        self.assertNotIn("Tarantulas", sections[0])
+        # Day 2: Tarantulas 3pts — Lions should NOT appear
+        self.assertNotIn("Lions", sections[1])
+
+    def test_single_block(self):
+        blocks = [(date(2024, 1, 15), ["Lions 3, Snakes 1\n"])]
+        with patch("builtins.print") as mock_print:
+            run_recursive_local(blocks)
+        output = mock_print.call_args[0][0]
+        self.assertIn("=== 2024-01-15 ===", output)
+
+
+# ---------------------------------------------------------------------------
+# run_recursive_verbose
+# ---------------------------------------------------------------------------
+
+class TestRunRecursiveVerbose(unittest.TestCase):
+
+    def _blocks(self):
+        return [
+            (date(2024, 1, 15), ["Lions 3, Snakes 3\n", "Tarantulas 1, FC Awesome 0\n"]),
+            (date(2024, 1, 16), ["Tarantulas 3, Snakes 1\n", "Lions 4, Grouches 0\n"]),
+            (date(2024, 1, 17), ["Lions 1, FC Awesome 1\n"]),
+        ]
+
+    def test_outputs_section_per_date(self):
+        with patch("builtins.print") as mock_print:
+            run_recursive_verbose(self._blocks())
+        output = mock_print.call_args[0][0]
+        self.assertIn("=== After 2024-01-15 ===", output)
+        self.assertIn("=== After 2024-01-16 ===", output)
+        self.assertIn("=== After 2024-01-17 ===", output)
+
+    def test_ranking_grows_cumulatively(self):
+        blocks = [
+            (date(2024, 1, 15), ["Lions 3, Snakes 1\n"]),
+            (date(2024, 1, 16), ["Tarantulas 3, FC Awesome 0\n"]),
+        ]
+        with patch("builtins.print") as mock_print:
+            run_recursive_verbose(blocks)
+        output = mock_print.call_args[0][0]
+        sections = output.split("\n\n")
+        # Day 1: only Lions and Snakes
+        self.assertNotIn("Tarantulas", sections[0])
+        # Day 2 cumulative: all four teams present
+        self.assertIn("Tarantulas", sections[1])
+        self.assertIn("Lions", sections[1])
+
+    def test_final_section_matches_global_ranking(self):
+        blocks = self._blocks()
+        # Get verbose output
+        with patch("builtins.print") as mock_print:
+            run_recursive_verbose(blocks)
+        verbose_output = mock_print.call_args[0][0]
+        final_section = verbose_output.split("\n\n")[-1]
+
+        # Get global output
+        with patch("builtins.print") as mock_print:
+            run_recursive(blocks)
+        global_output = mock_print.call_args[0][0]
+
+        # Final verbose section (without header) should match global table
+        final_table = "\n".join(final_section.split("\n")[1:])
+        self.assertEqual(final_table, global_output)
+
+
+# ---------------------------------------------------------------------------
+# v1 Integration
 # ---------------------------------------------------------------------------
 
 class TestIntegration(unittest.TestCase):
@@ -265,6 +640,69 @@ class TestIntegration(unittest.TestCase):
         points = calculate_points(results)
         ranked = rank_teams(points)
         self.assertEqual(ranked[0], (1, "Lions", 6))
+
+
+# ---------------------------------------------------------------------------
+# v2 End-to-end Integration
+# ---------------------------------------------------------------------------
+
+class TestV2Integration(unittest.TestCase):
+
+    SAMPLE_BLOCKS = [
+        (date(2024, 1, 15), [
+            "Lions 3, Snakes 3\n",
+            "Tarantulas 1, FC Awesome 0\n",
+        ]),
+        (date(2024, 1, 16), [
+            "Lions 1, FC Awesome 1\n",
+            "Tarantulas 3, Snakes 1\n",
+        ]),
+        (date(2024, 1, 17), [
+            "Lions 4, Grouches 0\n",
+        ]),
+    ]
+
+    def test_recursive_matches_manual_global(self):
+        with patch("builtins.print") as mock_print:
+            run_recursive(self.SAMPLE_BLOCKS)
+        output = mock_print.call_args[0][0]
+        self.assertEqual(
+            output,
+            "1. Tarantulas, 6 pts\n"
+            "2. Lions, 5 pts\n"
+            "3. FC Awesome, 1 pt\n"
+            "3. Snakes, 1 pt\n"
+            "5. Grouches, 0 pts",
+        )
+
+    def test_recursive_local_has_correct_number_of_sections(self):
+        with patch("builtins.print") as mock_print:
+            run_recursive_local(self.SAMPLE_BLOCKS)
+        output = mock_print.call_args[0][0]
+        # Each section header is "=== DATE ===" — two === per section
+        self.assertEqual(output.count("==="), len(self.SAMPLE_BLOCKS) * 2)
+
+    def test_recursive_verbose_section_count_matches_block_count(self):
+        with patch("builtins.print") as mock_print:
+            run_recursive_verbose(self.SAMPLE_BLOCKS)
+        output = mock_print.call_args[0][0]
+        self.assertEqual(output.count("=== After"), len(self.SAMPLE_BLOCKS))
+
+    def test_directory_to_recursive_global(self):
+        tmpdir = tempfile.mkdtemp()
+        files = {
+            "2024-01-15.txt": "Lions 3, Snakes 3\nTabrantulas 1, FC Awesome 0\n",
+            "2024-01-16.txt": "Tarantulas 3, Snakes 1\nLions 4, Grouches 0\n",
+        }
+        for name, content in files.items():
+            with open(os.path.join(tmpdir, name), "w") as f:
+                f.write(content)
+
+        from league_ranking import load_directory
+        blocks = load_directory(tmpdir)
+        self.assertEqual(len(blocks), 2)
+        self.assertEqual(blocks[0][0], date(2024, 1, 15))
+        self.assertEqual(blocks[1][0], date(2024, 1, 16))
 
 
 if __name__ == "__main__":
